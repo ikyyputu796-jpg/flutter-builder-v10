@@ -1,0 +1,82 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "Nama aplikasi"
+        required: true
+      source_url:
+        description: "URL source"
+        required: false
+        default: ""
+      source_type:
+        description: "Tipe: zip / url"
+        required: true
+        default: "zip"
+      user_id:
+        description: "Telegram user ID"
+        required: false
+        default: ""
+      attempt:
+        description: "Nomor percobaan"
+        required: false
+        default: "1"
+      build_mode:
+        description: "debug / release"
+        required: false
+        default: "release"
+      apk_name:
+        description: "Nama output APK"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    name: build-user-${{ inputs.user_id }}-attempt-${{ inputs.attempt }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.22.0"
+          channel: "stable"
+          cache: true
+
+      - name: Install dependencies
+        run: |
+          flutter --version
+          flutter config --no-analytics
+          flutter doctor
+
+      - name: Build APK
+        run: |
+          if [ ! -f pubspec.yaml ]; then
+            echo "ERROR: pubspec.yaml tidak ditemukan!"
+            exit 1
+          fi
+          flutter pub get
+          if [ "${{ inputs.build_mode }}" = "debug" ]; then
+            flutter build apk --debug --split-per-abi
+          else
+            flutter build apk --release --split-per-abi
+          fi
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app_name }}-${{ inputs.build_mode }}-attempt-${{ inputs.attempt }}
+          path: build/app/outputs/flutter-apk/*.apk
+          retention-days: 7
