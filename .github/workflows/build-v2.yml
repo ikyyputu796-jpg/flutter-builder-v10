@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 30
     env:
       PUB_ENVIRONMENT: ci
-      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.workers.max=4"
+      GRADLE_OPTS: "-Dorg.gradle.daemon=true -Dorg.gradle.workers.max=4 -Dorg.gradle.parallel=true -Dorg.gradle.caching=true"
 
     steps:
       # Tidak perlu setup-node & checkout: build hanya memakai ZIP dari bot.
@@ -67,9 +67,10 @@ jobs:
             ~/.gradle/caches
             ~/.gradle/wrapper
             ~/.pub-cache
-          key: ${{ runner.os }}-build-${{ hashFiles(format('{0}/pubspec.yaml', env.PROJECT_DIR), format('{0}/android/**/*.gradle*', env.PROJECT_DIR)) }}
+          key: ${{ runner.os }}-flutter-build-${{ hashFiles(format('{0}/pubspec.yaml', env.PROJECT_DIR), format('{0}/pubspec.lock', env.PROJECT_DIR), format('{0}/android/**/*.gradle*', env.PROJECT_DIR), format('{0}/android/gradle/wrapper/gradle-wrapper.properties', env.PROJECT_DIR)) }}
           restore-keys: |
-            ${{ runner.os }}-build-
+            ${{ runner.os }}-flutter-build-
+            ${{ runner.os }}-flutter-
 
       - name: Setup Flutter
         id: flutter1
@@ -85,7 +86,7 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: "stable"
-          cache: false
+          cache: true
 
       - name: Analyze Project Code
         if: ${{ github.event.inputs.only_analyze == 'true' }}
@@ -157,7 +158,7 @@ jobs:
           # ── SELF-HEALING: build -> baca log -> perbaiki otomatis -> build lagi (maks 4x) ──
           for ATTEMPT in 1 2 3 4; do
             echo "=== Build percobaan $ATTEMPT ==="
-            flutter build apk --$BUILD_TYPE $EXTRA 2>&1 | tee build.log
+            flutter build apk --$BUILD_TYPE --no-pub $EXTRA 2>&1 | tee build.log
             CODE=${PIPESTATUS[0]}
             [ "$CODE" -eq 0 ] && { echo "✅ Build sukses"; exit 0; }
 
