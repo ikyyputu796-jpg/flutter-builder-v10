@@ -51,10 +51,10 @@ jobs:
             PROJECT_DIR="project_raw"
           fi
           echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
-          # Versi Flutter
+          # Versi Flutter: hanya dipakai kalau berupa angka persis (3.24 / 3.24.5), selain itu stable
           VER="stable"
           if [ -f "$PROJECT_DIR/pubspec.yaml" ]; then
-            V=$(grep -E "^\s*flutter:\s*[\"']?[0-9]" "$PROJECT_DIR/pubspec.yaml" | head -1 | awk '{print $2}' | tr -d "\"'")
+            V=$(grep -E "^[[:space:]]+flutter:[[:space:]]*[\"']?[0-9]+\.[0-9]+(\.[0-9]+)?[\"']?[[:space:]]*$" "$PROJECT_DIR/pubspec.yaml" | head -1 | sed -E "s/.*flutter:[[:space:]]*//; s/[\"' ]//g")
             [ -n "$V" ] && VER="$V"
           fi
           echo "FLUTTER_VERSION=$VER" >> $GITHUB_ENV
@@ -72,11 +72,20 @@ jobs:
             ${{ runner.os }}-build-
 
       - name: Setup Flutter
+        id: flutter1
+        continue-on-error: true
         uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: "stable"
           cache: true
+
+      - name: Setup Flutter (fallback stable)
+        if: ${{ steps.flutter1.outcome == 'failure' }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          cache: false
 
       - name: Analyze Project Code
         if: ${{ github.event.inputs.only_analyze == 'true' }}
@@ -134,27 +143,76 @@ jobs:
           set +e
           BUILD_TYPE="${{ github.event.inputs.build_type }}"
           [ -z "$BUILD_TYPE" ] && BUILD_TYPE="release"
-          ABI_FLAG=""
-          [ "${{ github.event.inputs.abi }}" != "all" ] && ABI_FLAG="--target-platform android-arm64"
+          EXTRA=""
+          [ "${{ github.event.inputs.abi }}" != "all" ] && EXTRA="--target-platform android-arm64"
 
-          if [ -f "pubspec.yaml" ]; then
-            flutter build apk --$BUILD_TYPE $ABI_FLAG 2>&1 | tee build.log
-            CODE=${PIPESTATUS[0]}
-            # Retry hanya kalau penyebabnya memang tree-shake icon.
-            # Error kode (syntax Dart dll) langsung gagal — tidak buang menit untuk retry sia-sia.
-            if [ "$CODE" -ne 0 ] && grep -qiE "tree.?shak|IconData|font-subset" build.log; then
-              echo "↻ Retry tanpa tree-shake icons"
-              flutter build apk --$BUILD_TYPE $ABI_FLAG --no-tree-shake-icons
-              CODE=$?
-            fi
-            [ "$CODE" -ne 0 ] && { echo "❌ Build gagal"; exit 1; }
-          else
+          if [ ! -f "pubspec.yaml" ]; then
             G=$(find . -name "gradlew" | head -n 1)
             [ -z "$G" ] && { echo "❌ Tidak ada pubspec.yaml / gradlew"; exit 1; }
             cd "$(dirname "$G")" && chmod +x gradlew
             ./gradlew --parallel --build-cache assembleRelease || ./gradlew --parallel --build-cache assembleDebug || exit 1
+            exit 0
           fi
-          echo "✅ Build sukses"
+
+          # ── SELF-HEALING: build -> baca log -> perbaiki otomatis -> build lagi (maks 4x) ──
+          for ATTEMPT in 1 2 3 4; do
+            echo "=== Build percobaan $ATTEMPT ==="
+            flutter build apk --$BUILD_TYPE $EXTRA 2>&1 | tee build.log
+            CODE=${PIPESTATUS[0]}
+            [ "$CODE" -eq 0 ] && { echo "✅ Build sukses"; exit 0; }
+
+            FIXED=0
+
+            # a) tree-shake icon
+            if grep -qiE "tree.?shak|font-subset" build.log && [[ "$EXTRA" != *no-tree-shake-icons* ]]; then
+              EXTRA="$EXTRA --no-tree-shake-icons"; FIXED=1; echo "🔧 fix: no-tree-shake-icons"
+            fi
+
+            # b) plugin lama tanpa namespace (AGP 8+)
+            if grep -qi "Namespace not specified" build.log; then
+              for F in $HOME/.pub-cache/hosted/*/*/android/build.gradle $HOME/.pub-cache/hosted/*/*/android/build.gradle.kts; do
+                [ -f "$F" ] || continue
+                grep -q "namespace" "$F" && continue
+                PKG=$(grep -o 'package="[^"]*"' "$(dirname "$F")/src/main/AndroidManifest.xml" 2>/dev/null | head -1 | cut -d'"' -f2)
+                [ -z "$PKG" ] && continue
+                sed -i "/^android[[:space:]]*{/a\    namespace \"$PKG\"" "$F" && FIXED=1
+              done
+              echo "🔧 fix: namespace plugin"
+            fi
+
+            # c) minSdk terlalu rendah
+            if grep -qiE "minSdk(Version)?.*(cannot be smaller|higher than)|uses-sdk:minSdkVersion" build.log; then
+              for F in android/app/build.gradle android/app/build.gradle.kts; do
+                [ -f "$F" ] && sed -i -E "s/(minSdk(Version)?[ =]+)(flutter\.minSdkVersion|[0-9]+)/\123/" "$F"
+              done
+              FIXED=1; echo "🔧 fix: minSdk 23"
+            fi
+
+            # d) versi Kotlin terlalu lama
+            if grep -qiE "binary version of its metadata|Kotlin.*(incompatible|too old)" build.log; then
+              for F in android/build.gradle android/settings.gradle android/settings.gradle.kts android/build.gradle.kts; do
+                [ -f "$F" ] || continue
+                sed -i -E "s/(kotlin_version[ =]+['\"])[0-9.]+(['\"])/\11.9.24\2/; s/(org\.jetbrains\.kotlin\.android['\"][ ]*version[ ]*['\"])[0-9.]+(['\"])/\11.9.24\2/" "$F"
+              done
+              FIXED=1; echo "🔧 fix: kotlin 1.9.24"
+            fi
+
+            # e) dependency conflict
+            if grep -qiE "version solving failed|pub get failed" build.log && [ ! -f .pub_upgraded ]; then
+              flutter pub upgrade && touch .pub_upgraded; FIXED=1; echo "🔧 fix: pub upgrade"
+            fi
+
+            # f) cache gradle rusak
+            if grep -qiE "Could not (read|resolve)|Corrupt|checksum" build.log && [ ! -f .gradle_cleaned ]; then
+              (cd android && ./gradlew clean >/dev/null 2>&1); touch .gradle_cleaned; FIXED=1; echo "🔧 fix: gradle clean"
+            fi
+
+            # Tidak ada yang bisa diperbaiki otomatis (mis. salah syntax Dart) -> gagal cepat
+            if [ "$FIXED" -eq 0 ]; then
+              echo "❌ Error di kode project, tidak bisa diperbaiki otomatis"; exit 1
+            fi
+          done
+          echo "❌ Build masih gagal setelah 4 percobaan"; exit 1
 
       - name: Find APK
         if: ${{ github.event.inputs.only_analyze != 'true' }}
