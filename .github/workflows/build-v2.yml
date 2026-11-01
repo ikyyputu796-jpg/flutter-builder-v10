@@ -17,239 +17,158 @@ on:
         description: "Hanya jalankan analyze (true/false)"
         required: false
         default: "false"
+      abi:
+        description: "ABI: arm64 (tercepat & kecil) / all (semua ABI)"
+        required: false
+        default: "arm64"
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-    
-    steps:
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
+      PUB_ENVIRONMENT: ci
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.workers.max=4"
 
-      - name: Download ZIP project
+    steps:
+      # Tidak perlu setup-node & checkout: build hanya memakai ZIP dari bot.
+
+      - name: Download & Extract ZIP
         run: |
-          echo "=== Downloading ZIP ==="
-          echo "URL: ${{ github.event.inputs.zip_url }}"
-          curl -fL --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 15 \
+          curl -fL --retry 4 --retry-all-errors --retry-delay 1 --connect-timeout 10 \
             -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
             -H "Accept: application/octet-stream" \
-            "${{ github.event.inputs.zip_url }}" \
-            -o project.zip \
-            -w "\n=== HTTP Status: %{http_code} ===\n=== Downloaded bytes: %{size_download} ===\n=== Final URL: %{url_effective} ===\n"
-          echo ""
-          echo "=== File Info ==="
-          ls -lh project.zip
-          echo ""
-          echo "=== File Type ==="
-          file project.zip
-          echo ""
-          echo "=== First Bytes ==="
-          xxd -l 64 project.zip
-
-      - name: Extract ZIP
-        run: |
-          echo "=== Validating ZIP ==="
-          ATTEMPT=1
-          while [ "$ATTEMPT" -le 3 ] && ! unzip -t project.zip > /dev/null 2>&1; do
-            echo "⚠️  ZIP belum valid (percobaan $ATTEMPT/3), retry download..."
-            sleep $((ATTEMPT * 5))
-            curl -fL --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 15 \
-              -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
-              -H "Accept: application/octet-stream" \
-              "${{ github.event.inputs.zip_url }}" \
-              -o project.zip \
-              -w "\n=== Retry HTTP Status: %{http_code} ===\n=== Downloaded bytes: %{size_download} ===\n"
-            ATTEMPT=$((ATTEMPT + 1))
-          done
-
-          if ! unzip -t project.zip > /dev/null 2>&1; then
-            echo "❌ File bukan ZIP valid setelah 3x percobaan!"
-            exit 1
-          fi
-          echo "✅ ZIP valid"
-
-          echo "=== Extracting ZIP ==="
+            "${{ github.event.inputs.zip_url }}" -o project.zip
+          unzip -tq project.zip || { echo "❌ File bukan ZIP valid"; exit 1; }
           unzip -q project.zip -d project_raw
-
-          echo "=== Membersihkan Sampah ZIP ==="
           rm -rf project_raw/__MACOSX
           find project_raw -maxdepth 1 -type f -name ".*" -delete
-
-          echo "=== Mengunci Project Dir ==="
-          SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
-          FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
-          
-          if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
+          SUB=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
+          FILES=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
+          if [ "$SUB" -eq 1 ] && [ "$FILES" -eq 0 ]; then
             PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -n 1)
           else
             PROJECT_DIR="project_raw"
           fi
           echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          # Versi Flutter
+          VER="stable"
+          if [ -f "$PROJECT_DIR/pubspec.yaml" ]; then
+            V=$(grep -E "^\s*flutter:\s*[\"']?[0-9]" "$PROJECT_DIR/pubspec.yaml" | head -1 | awk '{print $2}' | tr -d "\"'")
+            [ -n "$V" ] && VER="$V"
+          fi
+          echo "FLUTTER_VERSION=$VER" >> $GITHUB_ENV
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
+      # Cache dipasang SETELAH ZIP diekstrak supaya key-nya benar-benar mengikuti project
+      - name: Cache Gradle & Pub
+        uses: actions/cache@v4
         with:
-          distribution: "temurin"
-          java-version: "17"
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.pub-cache
+          key: ${{ runner.os }}-build-${{ hashFiles(format('{0}/pubspec.yaml', env.PROJECT_DIR), format('{0}/android/**/*.gradle*', env.PROJECT_DIR)) }}
+          restore-keys: |
+            ${{ runner.os }}-build-
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: "3.41.4"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: "stable"
           cache: true
 
       - name: Analyze Project Code
-        working-directory: ${{ env.PROJECT_DIR }}
-        continue-on-error: true
-        run: |
-          if [ -f "pubspec.yaml" ]; then
-            set +e
-            flutter analyze > analyze_report.txt 2>&1
-            ANALYZE_EXIT=$?
-            set -e
-            echo "[RESULT_ANALYZE]"
-            cat analyze_report.txt
-            echo "[END_RESULT_ANALYZE]"
-            rm -f analyze_report.txt
-            echo "ANALYZE_EXIT=$ANALYZE_EXIT" >> $GITHUB_ENV
-          else
-            echo "[RESULT_ANALYZE]"
-            echo "❌ pubspec.yaml tidak ditemukan."
-            echo "[END_RESULT_ANALYZE]"
-            echo "ANALYZE_EXIT=1" >> $GITHUB_ENV
-          fi
-
-      - name: Stop if Analyze Only
         if: ${{ github.event.inputs.only_analyze == 'true' }}
-        run: exit ${{ env.ANALYZE_EXIT }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set +e
+          flutter pub get > /dev/null 2>&1
+          flutter analyze > analyze_report.txt 2>&1
+          CODE=$?
+          echo "[RESULT_ANALYZE]"
+          cat analyze_report.txt
+          echo "[END_RESULT_ANALYZE]"
+          exit $CODE
 
-      - name: Prepare Android project
+      - name: Auto-Fix & Prepare Android Project
+        if: ${{ github.event.inputs.only_analyze != 'true' }}
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
-          if [ ! -f "pubspec.yaml" ]; then
-            echo "No pubspec.yaml, skip Flutter prep"
-            exit 0
-          fi
-
-          if [ ! -d "android" ]; then
-            flutter create --platforms=android .
-          fi
+          [ -f "pubspec.yaml" ] || { echo "No pubspec.yaml, skip Flutter prep"; exit 0; }
+          [ -d "android" ] || flutter create --platforms=android .
 
           PROP_FILE="android/gradle.properties"
           touch "$PROP_FILE"
-          sed -i "/^android.builtInKotlin=/d" "$PROP_FILE" 2>/dev/null || true
-          sed -i "/^android.newDsl=/d" "$PROP_FILE" 2>/dev/null || true
-          sed -i "/^android.defaults.buildfeatures.buildconfig=/d" "$PROP_FILE" 2>/dev/null || true
-          sed -i "/^android.nonTransitiveRClass=/d" "$PROP_FILE" 2>/dev/null || true
-          sed -i "/^org.gradle.jvmargs=/d" "$PROP_FILE" 2>/dev/null || true
-          sed -i "/^android.enableR8.fullMode=/d" "$PROP_FILE" 2>/dev/null || true
+          for K in android.builtInKotlin android.newDsl android.defaults.buildfeatures.buildconfig \
+                   android.nonTransitiveRClass org.gradle.jvmargs android.enableR8.fullMode \
+                   org.gradle.parallel org.gradle.caching org.gradle.configureondemand; do
+            sed -i "/^$K=/d" "$PROP_FILE" 2>/dev/null || true
+          done
           {
             echo "android.builtInKotlin=false"
             echo "android.newDsl=false"
             echo "android.defaults.buildfeatures.buildconfig=true"
             echo "android.nonTransitiveRClass=false"
             echo "android.enableR8.fullMode=false"
-            echo "org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G -XX:+HeapDumpOnOutOfMemoryError"
+            echo "org.gradle.jvmargs=-Xmx5G -XX:MaxMetaspaceSize=1G -XX:+UseParallelGC"
             echo "org.gradle.parallel=true"
+            echo "org.gradle.caching=true"
+            echo "org.gradle.configureondemand=true"
           } >> "$PROP_FILE"
 
           for SF in android/settings.gradle android/settings.gradle.kts; do
-            if [ -f "$SF" ]; then
-              sed -i -E "s/version[[:space:]]+['\"]9\.[0-9.]+['\"]/version \"8.7.2\"/g" "$SF" 2>/dev/null || true
-            fi
+            [ -f "$SF" ] && sed -i -E "s/version[[:space:]]+['\"]9\.[0-9.]+['\"]/version \"8.7.2\"/g" "$SF" || true
           done
-
           for BF in android/build.gradle android/build.gradle.kts; do
-            if [ -f "$BF" ]; then
-              sed -i -E "s/com\.android\.tools\.build:gradle:9\.[0-9.]+/com.android.tools.build:gradle:8.7.2/g" "$BF" 2>/dev/null || true
-            fi
+            [ -f "$BF" ] && sed -i -E "s/com\.android\.tools\.build:gradle:9\.[0-9.]+/com.android.tools.build:gradle:8.7.2/g" "$BF" || true
           done
 
-          echo "=== gradle.properties ==="
-          cat "$PROP_FILE"
+          flutter pub get || { flutter clean || true; flutter pub get; }
 
-          echo "=== flutter pub get ==="
-          set +e
-          flutter pub get
-          PUB_EXIT=$?
-          set -e
-          if [ "$PUB_EXIT" -ne 0 ]; then
-            echo "pub get gagal, coba flutter clean + pub get..."
-            flutter clean || true
-            flutter pub get || true
-          fi
-
-      - name: Build APK (multi-fallback)
+      - name: Build APK
+        if: ${{ github.event.inputs.only_analyze != 'true' }}
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set +e
           BUILD_TYPE="${{ github.event.inputs.build_type }}"
-          if [ -z "$BUILD_TYPE" ]; then BUILD_TYPE="release"; fi
+          [ -z "$BUILD_TYPE" ] && BUILD_TYPE="release"
+          ABI_FLAG=""
+          [ "${{ github.event.inputs.abi }}" != "all" ] && ABI_FLAG="--target-platform android-arm64"
 
-          build_once() {
-            local mode="$1"
-            local extra="$2"
-            echo ""
-            echo "=========================================="
-            echo " TRY: flutter build apk --$mode $extra"
-            echo "=========================================="
-            flutter build apk --$mode $extra
-            return $?
-          }
-
-          SUCCESS=0
           if [ -f "pubspec.yaml" ]; then
-            if build_once "$BUILD_TYPE" ""; then
-              SUCCESS=1
-            elif build_once "$BUILD_TYPE" "--no-tree-shake-icons"; then
-              SUCCESS=1
-            elif [ "$BUILD_TYPE" != "debug" ] && build_once "debug" ""; then
-              SUCCESS=1
-            elif build_once "debug" "--no-tree-shake-icons"; then
-              SUCCESS=1
+            flutter build apk --$BUILD_TYPE $ABI_FLAG 2>&1 | tee build.log
+            CODE=${PIPESTATUS[0]}
+            # Retry hanya kalau penyebabnya memang tree-shake icon.
+            # Error kode (syntax Dart dll) langsung gagal — tidak buang menit untuk retry sia-sia.
+            if [ "$CODE" -ne 0 ] && grep -qiE "tree.?shak|IconData|font-subset" build.log; then
+              echo "↻ Retry tanpa tree-shake icons"
+              flutter build apk --$BUILD_TYPE $ABI_FLAG --no-tree-shake-icons
+              CODE=$?
             fi
+            [ "$CODE" -ne 0 ] && { echo "❌ Build gagal"; exit 1; }
           else
-            GRADLE_PATH=$(find . -name "gradlew" | head -n 1)
-            if [ -n "$GRADLE_PATH" ]; then
-              GRADLE_DIR=$(dirname "$GRADLE_PATH")
-              cd "$GRADLE_DIR" && chmod +x gradlew
-              ./gradlew assembleRelease || ./gradlew assembleDebug
-              [ $? -eq 0 ] && SUCCESS=1
-            fi
-          fi
-          set -e
-
-          if [ "$SUCCESS" -ne 1 ]; then
-            echo "❌ Semua strategi build gagal"
-            exit 1
+            G=$(find . -name "gradlew" | head -n 1)
+            [ -z "$G" ] && { echo "❌ Tidak ada pubspec.yaml / gradlew"; exit 1; }
+            cd "$(dirname "$G")" && chmod +x gradlew
+            ./gradlew --parallel --build-cache assembleRelease || ./gradlew --parallel --build-cache assembleDebug || exit 1
           fi
           echo "✅ Build sukses"
 
-      - name: Check APK Output
+      - name: Find APK
+        if: ${{ github.event.inputs.only_analyze != 'true' }}
         run: |
-          APK_FOUND=$(find $GITHUB_WORKSPACE -name "*.apk" | head -n 1)
-          if [ -z "$APK_FOUND" ]; then
-            echo "❌ Tidak ada file APK hasil build"
-            find $GITHUB_WORKSPACE -type f -name "*.apk" -o -name "*.aab" 2>/dev/null | head -20
-            exit 1
-          fi
-          APK_PATH=$(echo "$APK_FOUND" | sed "s|$GITHUB_WORKSPACE/||")
-          echo "APK ditemukan: $APK_PATH"
-          echo "PROJECT_DIR=$GITHUB_WORKSPACE" >> $GITHUB_ENV
-          echo "APK_PATH=$APK_PATH" >> $GITHUB_ENV
-          ls -lh "$APK_FOUND"
+          APK=$(find "$GITHUB_WORKSPACE" -name "*.apk" -not -path "*/intermediates/*" | head -n 1)
+          [ -z "$APK" ] && { echo "❌ Tidak ada file APK hasil build"; exit 1; }
+          echo "APK_PATH=${APK#$GITHUB_WORKSPACE/}" >> $GITHUB_ENV
 
       - name: Upload APK artifact
+        if: ${{ github.event.inputs.only_analyze != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: flutter-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
-          path: ${{ env.PROJECT_DIR }}/${{ env.APK_PATH }}
+          path: ${{ env.APK_PATH }}
           retention-days: 1
+          compression-level: 0   # APK sudah terkompresi; upload & download jauh lebih cepat
           if-no-files-found: error
