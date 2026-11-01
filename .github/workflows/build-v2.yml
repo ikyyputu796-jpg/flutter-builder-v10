@@ -51,13 +51,21 @@ jobs:
             PROJECT_DIR="project_raw"
           fi
           echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
-          # Versi Flutter: hanya dipakai kalau berupa angka persis (3.24 / 3.24.5), selain itu stable
+          # Hormati versi Flutter yang dipatok project (FVM / file version).
+          # Jika tidak dipatok, gunakan stable. Versi Dart mengikuti Flutter SDK terpilih.
           VER="stable"
-          if [ -f "$PROJECT_DIR/pubspec.yaml" ]; then
-            V=$(grep -E "^[[:space:]]+flutter:[[:space:]]*[\"']?[0-9]+\.[0-9]+(\.[0-9]+)?[\"']?[[:space:]]*$" "$PROJECT_DIR/pubspec.yaml" | head -1 | sed -E "s/.*flutter:[[:space:]]*//; s/[\"' ]//g")
+          if [ -f "$PROJECT_DIR/.fvmrc" ]; then
+            V=$(python3 -c 'import json; d=json.load(open("'"$PROJECT_DIR"'/.fvmrc")); print(d.get("flutter", ""))' 2>/dev/null || true)
             [ -n "$V" ] && VER="$V"
           fi
+          for VF in "$PROJECT_DIR/.flutter-version" "$PROJECT_DIR/FLUTTER_VERSION" "$PROJECT_DIR/.fvm/flutter_sdk/version"; do
+            if [ "$VER" = "stable" ] && [ -f "$VF" ]; then
+              V=$(head -n 1 "$VF" | tr -d '\r[:space:]')
+              [ -n "$V" ] && VER="$V"
+            fi
+          done
           echo "FLUTTER_VERSION=$VER" >> $GITHUB_ENV
+          echo "Flutter SDK requested: $VER"
 
       # Cache dipasang SETELAH ZIP diekstrak supaya key-nya benar-benar mengikuti project
       - name: Cache Gradle & Pub
@@ -128,14 +136,13 @@ jobs:
             echo "org.gradle.configureondemand=true"
           } >> "$PROP_FILE"
 
-          for SF in android/settings.gradle android/settings.gradle.kts; do
-            [ -f "$SF" ] && sed -i -E "s/version[[:space:]]+['\"]9\.[0-9.]+['\"]/version \"8.7.2\"/g" "$SF" || true
-          done
-          for BF in android/build.gradle android/build.gradle.kts; do
-            [ -f "$BF" ] && sed -i -E "s/com\.android\.tools\.build:gradle:9\.[0-9.]+/com.android.tools.build:gradle:8.7.2/g" "$BF" || true
-          done
-
+          # Jangan memaksa versi AGP/Kotlin secara global: kombinasi yang cocok
+          # bergantung pada Gradle wrapper, Android Gradle Plugin, dan Flutter project.
           flutter pub get || { flutter clean || true; flutter pub get; }
+
+          # Terapkan hanya migrasi/fix yang dinilai aman oleh Dart analyzer.
+          # Tidak mengganti API atau logika bisnis secara spekulatif.
+          dart fix --apply || true
 
       - name: Build APK
         if: ${{ github.event.inputs.only_analyze != 'true' }}
@@ -164,12 +171,23 @@ jobs:
 
             FIXED=0
 
-            # a) tree-shake icon
+            # a) Dart analyzer safe fixes (mis. deprecated API / lint yang punya fix).
+            # Batasi satu kali agar tidak mengulang tanpa perubahan.
+            if grep -qiE "\.dart:[0-9]+:[0-9]+|Error:|error -" build.log && [ ! -f .dart_fix_applied ]; then
+              if dart fix --apply > dart_fix.log 2>&1; then
+                touch .dart_fix_applied
+                flutter pub get >/dev/null 2>&1 || true
+                FIXED=1
+                echo "🔧 fix: dart fix --apply (safe analyzer fixes)"
+              fi
+            fi
+
+            # b) tree-shake icon
             if grep -qiE "tree.?shak|font-subset" build.log && [[ "$EXTRA" != *no-tree-shake-icons* ]]; then
               EXTRA="$EXTRA --no-tree-shake-icons"; FIXED=1; echo "🔧 fix: no-tree-shake-icons"
             fi
 
-            # b) plugin lama tanpa namespace (AGP 8+)
+            # c) plugin lama tanpa namespace (AGP 8+)
             if grep -qi "Namespace not specified" build.log; then
               for F in $HOME/.pub-cache/hosted/*/*/android/build.gradle $HOME/.pub-cache/hosted/*/*/android/build.gradle.kts; do
                 [ -f "$F" ] || continue
@@ -181,7 +199,7 @@ jobs:
               echo "🔧 fix: namespace plugin"
             fi
 
-            # c) minSdk terlalu rendah
+            # d) minSdk terlalu rendah
             if grep -qiE "minSdk(Version)?.*(cannot be smaller|higher than)|uses-sdk:minSdkVersion" build.log; then
               for F in android/app/build.gradle android/app/build.gradle.kts; do
                 [ -f "$F" ] || continue
@@ -190,7 +208,7 @@ jobs:
               FIXED=1; echo "🔧 fix: minSdk 23"
             fi
 
-            # d) versi Kotlin terlalu lama
+            # e) versi Kotlin terlalu lama
             if grep -qiE "binary version of its metadata|Kotlin.*(incompatible|too old)" build.log; then
               for F in android/build.gradle android/settings.gradle android/settings.gradle.kts android/build.gradle.kts; do
                 [ -f "$F" ] || continue
@@ -199,19 +217,19 @@ jobs:
               FIXED=1; echo "🔧 fix: kotlin 1.9.24"
             fi
 
-            # e) dependency conflict
+            # f) dependency conflict
             if grep -qiE "version solving failed|pub get failed" build.log && [ ! -f .pub_upgraded ]; then
               flutter pub upgrade && touch .pub_upgraded; FIXED=1; echo "🔧 fix: pub upgrade"
             fi
 
-            # f) cache gradle rusak
+            # g) cache gradle rusak
             if grep -qiE "Could not (read|resolve)|Corrupt|checksum" build.log && [ ! -f .gradle_cleaned ]; then
               (cd android && ./gradlew clean >/dev/null 2>&1); touch .gradle_cleaned; FIXED=1; echo "🔧 fix: gradle clean"
             fi
 
-            # Tidak ada yang bisa diperbaiki otomatis (mis. salah syntax Dart) -> gagal cepat
+            # Jika analyzer tidak memiliki safe-fix, jangan mengubah kode secara berisiko.
             if [ "$FIXED" -eq 0 ]; then
-              echo "❌ Error di kode project, tidak bisa diperbaiki otomatis"; exit 1
+              echo "❌ Tidak ada perbaikan otomatis yang aman untuk error ini. Lihat build.log dan analyze report."; exit 1
             fi
           done
           echo "❌ Build masih gagal setelah 4 percobaan"; exit 1
