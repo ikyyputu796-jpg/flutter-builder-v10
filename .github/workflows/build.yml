@@ -1,82 +1,494 @@
-name: Build Flutter APK
+name: Build Flutter APK (Universal)
+run-name: "Build ${{ github.event.inputs.jobId }}"
+
+# Workflow ini di-sync otomatis oleh bot (server.js -> syncWorkflowFile).
+# Jangan edit manual di repo worker, edit di workflow/build-flutter.yml pada source bot.
 
 on:
   workflow_dispatch:
     inputs:
-      app_name:
-        description: "Nama aplikasi"
-        required: true
-      source_url:
-        description: "URL source"
+      jobId:
+        description: 'Job ID dari bot'
         required: false
-        default: ""
-      source_type:
-        description: "Tipe: zip / url"
-        required: true
-        default: "zip"
-      user_id:
-        description: "Telegram user ID"
+        default: ''
+      userId:
+        description: 'User ID Telegram'
         required: false
-        default: ""
-      attempt:
-        description: "Nomor percobaan"
+        default: '0'
+      payload:
+        description: 'Payload build (JSON)'
         required: false
-        default: "1"
-      build_mode:
-        description: "debug / release"
-        required: false
-        default: "release"
-      apk_name:
-        description: "Nama output APK"
-        required: false
-        default: ""
+        default: '{}'
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    name: build-user-${{ inputs.user_id }}-attempt-${{ inputs.attempt }}
-
+    timeout-minutes: 150
+    env:
+      PAYLOAD: ${{ github.event.inputs.payload }}
+      JOB_ID: ${{ github.event.inputs.jobId }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CI: "true"
+      FLUTTER_SUPPRESS_ANALYTICS: "true"
+      PUB_ENVIRONMENT: "bot_build"
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: "zulu"
-          java-version: "17"
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: "3.22.0"
-          channel: "stable"
-          cache: true
-
-      - name: Install dependencies
+      - name: Siapkan runner
         run: |
-          flutter --version
-          flutter config --no-analytics
-          flutter doctor
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL" 2>/dev/null || true
+          git config --global --add safe.directory '*'
+          if [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME" ]; then
+            sudo chmod -R a+rwX "$ANDROID_HOME" 2>/dev/null || true
+            JH17="${JAVA_HOME_17_X64:-}"
+            if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ] && [ -n "$JH17" ]; then
+              set +o pipefail
+              yes | JAVA_HOME="$JH17" "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+            fi
+          fi
+          df -h / | tail -1
 
-      - name: Build APK
+      - name: Download & temukan project
         run: |
-          if [ ! -f pubspec.yaml ]; then
-            echo "ERROR: pubspec.yaml tidak ditemukan!"
+          set -euo pipefail
+          printf '%s' "$PAYLOAD" > payload.json
+          if ! python3 -c 'import json; assert isinstance(json.load(open("payload.json")), dict)' 2>/dev/null; then
+            echo "::error::Payload bukan JSON valid. Isi payload:"; cat payload.json; exit 1
+          fi
+          cat > "$GITHUB_WORKSPACE/pj.py" <<'PY'
+          import json, os, sys
+          try:
+              d = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "payload.json")))
+              v = d.get(sys.argv[1]) if isinstance(d, dict) else None
+          except Exception:
+              v = None
+          print("" if v is None else v)
+          PY
+          pj() { python3 "$GITHUB_WORKSPACE/pj.py" "$1"; }
+          ASSET_URL=$(pj zipAssetUrl); [ -n "$ASSET_URL" ] || ASSET_URL=$(pj url)
+          TAG=$(pj tag)
+          MODE=$(pj mode); [ -n "$MODE" ] || MODE=zip
+          if [ "$MODE" != "zip" ]; then
+            echo "::error::Mode '$MODE' belum didukung workflow ini (hanya build dari ZIP project Flutter)."; exit 1
+          fi
+          if [ -z "$ASSET_URL" ]; then
+            echo "::error::Tidak ada url / zipAssetUrl di payload."; cat payload.json; exit 1
+          fi
+          rm -rf project dl project.zip; mkdir -p project dl
+          GOT=0
+          if [ -n "$TAG" ]; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*' --dir dl 2>/dev/null && GOT=1 || true
+            if [ "$GOT" = 1 ]; then cp "$(ls -1 dl/* | head -n 1)" project.zip; fi
+          fi
+          if [ "$GOT" = 0 ]; then
+            if [[ "$ASSET_URL" == *"api.github.com"* ]]; then
+              curl -fL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" -o project.zip "$ASSET_URL" && GOT=1 || true
+            else
+              curl -fL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" -o project.zip "$ASSET_URL" && GOT=1 || \
+              curl -fL --retry 3 -o project.zip "$ASSET_URL" && GOT=1 || true
+            fi
+          fi
+          if [ "$GOT" = 0 ] || [ ! -s project.zip ]; then
+            echo "::error::Gagal mengunduh source project dari: $ASSET_URL"; exit 1
+          fi
+          cat > extract.py <<'PY'
+          import zipfile, os, sys, shutil
+          z = zipfile.ZipFile(sys.argv[1])
+          dest = os.path.realpath(sys.argv[2])
+          os.makedirs(dest, exist_ok=True)
+          for i in z.infolist():
+              name = i.filename.replace("\\", "/")
+              if name.startswith("__MACOSX/") or "/__MACOSX/" in name:
+                  continue
+              target = os.path.realpath(os.path.join(dest, name))
+              if target != dest and not target.startswith(dest + os.sep):
+                  continue
+              if name.endswith("/"):
+                  os.makedirs(target, exist_ok=True)
+                  continue
+              os.makedirs(os.path.dirname(target), exist_ok=True)
+              with z.open(i) as s, open(target, "wb") as o:
+                  shutil.copyfileobj(s, o)
+              mode = (i.external_attr >> 16) & 0o777
+              if mode:
+                  os.chmod(target, mode | 0o644)
+          PY
+          python3 extract.py project.zip project || unzip -q -o project.zip -d project || 7z x -y -oproject project.zip >/dev/null
+          cat > findroot.py <<'PY'
+          import os, re, sys
+          base = "project"
+          SKIP = {".dart_tool", "build", ".git", "node_modules", ".symlinks", "Pods",
+                  "ios", "macos", "windows", "linux", "web", "android", "__MACOSX"}
+          found = []
+          for d, dirs, files in os.walk(base):
+              dirs[:] = [x for x in dirs if x not in SKIP]
+              if "pubspec.yaml" in files:
+                  t = open(os.path.join(d, "pubspec.yaml"), encoding="utf-8", errors="ignore").read()
+                  score = 0
+                  if re.search(r"^\s*sdk:\s*flutter", t, re.M): score += 2
+                  if re.search(r"^flutter:\s*$", t, re.M): score += 1
+                  if os.path.isdir(os.path.join(d, "android")): score += 3
+                  if "example" in d.split(os.sep): score -= 5
+                  found.append((-score, d.count(os.sep), d))
+          if not found:
+              sys.exit(1)
+          found.sort()
+          print(found[0][2])
+          PY
+          if ! PROJECT_ROOT=$(python3 findroot.py); then
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Pastikan ini project Flutter yang valid."
+            find project -maxdepth 3 | head -n 60
             exit 1
           fi
-          flutter pub get
-          if [ "${{ inputs.build_mode }}" = "debug" ]; then
-            flutter build apk --debug --split-per-abi
-          else
-            flutter build apk --release --split-per-abi
+          PROJECT_ROOT="$(cd "$PROJECT_ROOT" && pwd)"
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "Project Flutter ditemukan di: $PROJECT_ROOT"
+
+      - name: Pilih versi Flutter & Java otomatis
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 5 https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json -o releases.json
+          cat > select_versions.py <<'PY'
+          import json, os, re, sys
+
+          def vt(s):
+              m = re.findall(r"\d+", re.sub(r"[-+].*$", "", str(s).lstrip("vV")))
+              t = [int(x) for x in m[:3]]
+              while len(t) < 3:
+                  t.append(0)
+              return tuple(t)
+
+          def parse_constraint(s):
+              """Return (lo, lo_inc, hi, hi_inc); None bound = open."""
+              s = (s or "").strip().strip("'\"")
+              if not s or s == "any":
+                  return (None, True, None, True)
+              lo, lo_inc, hi, hi_inc = None, True, None, True
+              for tok in re.findall(r"(\^|>=|<=|>|<|=)?\s*(\d+(?:\.\d+){0,2}(?:[-+][\w.]+)?)", s):
+                  op, ver = tok
+                  v = vt(ver)
+                  if op == "^":
+                      lo, lo_inc = v, True
+                      if v[0] > 0: hi = (v[0] + 1, 0, 0)
+                      elif v[1] > 0: hi = (0, v[1] + 1, 0)
+                      else: hi = (0, 0, v[2] + 1)
+                      hi_inc = False
+                  elif op == ">=": lo, lo_inc = v, True
+                  elif op == ">": lo, lo_inc = v, False
+                  elif op == "<=": hi, hi_inc = v, True
+                  elif op == "<": hi, hi_inc = v, False
+                  else:
+                      lo, lo_inc, hi, hi_inc = v, True, v, True
+              return (lo, lo_inc, hi, hi_inc)
+
+          def satisfies(v, c):
+              lo, lo_inc, hi, hi_inc = c
+              if lo is not None and (v < lo or (v == lo and not lo_inc)): return False
+              if hi is not None and (v > hi or (v == hi and not hi_inc)): return False
+              return True
+
+          def read(root, rel):
+              try:
+                  with open(os.path.join(root, rel), encoding="utf-8", errors="ignore") as f:
+                      return f.read()
+              except Exception:
+                  return ""
+
+          def env_block(text):
+              out, inside = {}, False
+              for line in text.splitlines():
+                  if re.match(r"^environment\s*:", line):
+                      inside = True
+                      continue
+                  if inside:
+                      if line.strip() == "" or line.lstrip().startswith("#"):
+                          continue
+                      if not line.startswith((" ", "\t")):
+                          break
+                      m = re.match(r"^\s+(\w+)\s*:\s*(.+?)\s*(#.*)?$", line)
+                      if m:
+                          out[m.group(1)] = m.group(2).strip().strip("'\"")
+              return out
+
+          def lock_sdks(text):
+              out, inside = {}, False
+              for line in text.splitlines():
+                  if re.match(r"^sdks\s*:", line):
+                      inside = True
+                      continue
+                  if inside:
+                      if not line.startswith((" ", "\t")):
+                          break
+                      m = re.match(r"^\s+(\w+)\s*:\s*(.+?)\s*$", line)
+                      if m:
+                          out[m.group(1)] = m.group(2).strip().strip("'\"")
+              return out
+
+          def gradle_version(root):
+              t = read(root, "android/gradle/wrapper/gradle-wrapper.properties")
+              m = re.search(r"gradle-(\d+(?:\.\d+){0,2})", t)
+              return vt(m.group(1)) if m else None
+
+          def pick_java(gradle, flutter_ver):
+              if gradle:
+                  if gradle < (5, 0, 0): return 8
+                  if gradle < (7, 3, 0): return 11
+                  return 17
+              return 11 if flutter_ver < (3, 7, 0) else 17
+
+          def main(root, releases_path, payload_path, out_path):
+              try:
+                  payload = json.load(open(payload_path))
+                  if not isinstance(payload, dict): payload = {}
+              except Exception:
+                  payload = {}
+
+              data = json.load(open(releases_path))
+              stable = []
+              for r in data.get("releases", []):
+                  if r.get("channel") != "stable": continue
+                  m = re.search(r"\d+\.\d+\.\d+", str(r.get("dart_sdk_version") or ""))
+                  stable.append({"tag": r["version"], "fv": vt(r["version"]),
+                                 "dart": vt(m.group(0)) if m else None})
+              if not stable:
+                  print("::error::Gagal membaca daftar rilis Flutter"); sys.exit(1)
+              stable.sort(key=lambda x: x["fv"])
+              latest = stable[-1]
+
+              cands, notes = [], []
+              def add(tag, why):
+                  if tag and tag not in [c for c, _ in cands]:
+                      cands.append((tag, why))
+
+              forced = str(payload.get("flutterVersion") or "").strip()
+              if forced:
+                  add(forced, "dipaksa lewat payload")
+                  return finish(cands, root, out_path, latest, stable)
+
+              # --- hint eksplisit dari project (FVM / asdf) ---
+              hint = ""
+              try:
+                  j = json.loads(read(root, ".fvmrc") or "{}")
+                  hint = str(j.get("flutter") or "")
+              except Exception: pass
+              if not hint:
+                  try:
+                      j = json.loads(read(root, ".fvm/fvm_config.json") or "{}")
+                      hint = str(j.get("flutterSdkVersion") or "")
+                  except Exception: pass
+              if not hint:
+                  m = re.search(r"^flutter\s+([\w.\-]+)", read(root, ".tool-versions"), re.M)
+                  if m: hint = m.group(1)
+              hint = re.sub(r"@.*$", "", hint).replace("-stable", "").strip()
+              if re.match(r"^v?\d+\.\d+", hint):
+                  match = [s for s in stable if s["fv"] == vt(hint)]
+                  if match: add(match[-1]["tag"], "pin FVM/asdf di project")
+              elif hint in ("stable", "beta"):
+                  add(hint, "channel dari FVM/asdf")
+
+              # --- constraint dari pubspec + pubspec.lock ---
+              env = env_block(read(root, "pubspec.yaml"))
+              lock = lock_sdks(read(root, "pubspec.lock"))
+              dart_c = parse_constraint(env.get("sdk"))
+              fl_c = parse_constraint(env.get("flutter"))
+              lock_dart = parse_constraint(lock.get("dart"))
+              lock_fl = parse_constraint(lock.get("flutter"))
+
+              def ok(s):
+                  if s["dart"] is None: return False
+                  if not satisfies(s["dart"], dart_c): return False
+                  if not satisfies(s["fv"], fl_c): return False
+                  # lock = batas minimum nyata hasil resolve dependency; hanya dipakai sbg batas bawah
+                  if lock_dart[0] and s["dart"] < lock_dart[0]: return False
+                  if lock_fl[0] and s["fv"] < lock_fl[0]: return False
+                  return True
+
+              pool = [s for s in stable if ok(s)]
+              if not pool:  # lock terlalu ketat -> abaikan lock
+                  pool = [s for s in stable if s["dart"] and satisfies(s["dart"], dart_c) and satisfies(s["fv"], fl_c)]
+              lines = {}
+              for s in pool:
+                  lines.setdefault(s["dart"][:2], []).append(s)
+              ordered = [max(v, key=lambda x: x["fv"]) for k, v in sorted(lines.items())]
+
+              if not env.get("sdk") and not env.get("flutter"):
+                  add(latest["tag"], "tanpa constraint di pubspec -> stable terbaru")
+                  old = [s for s in stable if s["fv"] == vt("1.22.6")]
+                  if old: add(old[0]["tag"], "cadangan era sebelum null-safety")
+              else:
+                  for i, s in enumerate(ordered[:4]):
+                      add(s["tag"], "era Dart %d.%d (sesuai constraint)" % s["dart"][:2] if i == 0 else "naik ke Dart %d.%d" % s["dart"][:2])
+                  add(latest["tag"], "stable terbaru")
+                  if not pool:
+                      add(latest["tag"], "constraint tak cocok rilis manapun -> stable terbaru")
+              return finish(cands, root, out_path, latest, stable)
+
+          def finish(cands, root, out_path, latest, stable):
+              cands = cands[:6]
+              gradle = gradle_version(root)
+              lines = []
+              for tag, why in cands:
+                  fv = vt(tag) if re.match(r"^v?\d", tag) else latest["fv"]
+                  lines.append("%s|%d|%s" % (tag, pick_java(gradle, fv), why))
+              with open(out_path, "w") as f:
+                  f.write("\n".join(lines) + "\n")
+              print("Gradle wrapper:", ".".join(map(str, gradle)) if gradle else "tidak ada")
+              for l in lines: print("Kandidat:", l)
+
+          if __name__ == "__main__":
+              main(*sys.argv[1:5])
+          PY
+          python3 select_versions.py "$PROJECT_ROOT" releases.json payload.json "$GITHUB_WORKSPACE/candidates.txt"
+
+      - name: Build APK (coba beberapa versi sampai berhasil)
+        run: |
+          set -u
+          set -o pipefail
+          set +e
+          START=$(date +%s)
+          pj() { python3 "$GITHUB_WORKSPACE/pj.py" "$1"; }
+          BUILD_TYPE=$(pj buildType)
+          [ "$BUILD_TYPE" = "debug" ] || BUILD_TYPE=release
+          FLAVOR=$(pj flavor)
+          EXTRA_ARGS=$(pj buildArgs)
+          cd "$PROJECT_ROOT"
+
+          # ---- perbaikan file umum (best effort, tidak pernah menggagalkan build) ----
+          rm -rf build .dart_tool android/.gradle android/local.properties 2>/dev/null || true
+          if [ -f android/gradlew ]; then
+            sed -i 's/\r$//' android/gradlew 2>/dev/null || true
+            chmod +x android/gradlew 2>/dev/null || true
           fi
+          if [ -d android ]; then
+            GP=android/gradle.properties
+            touch "$GP"
+            tail -c1 "$GP" | read -r _ || echo >> "$GP"
+            grep -q '^org.gradle.jvmargs' "$GP" || echo 'org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g' >> "$GP"
+            grep -q '^android.useAndroidX' "$GP" || echo 'android.useAndroidX=true' >> "$GP"
+            grep -q '^android.enableJetifier' "$GP" || echo 'android.enableJetifier=true' >> "$GP"
+          fi
+          PKG_NAME=$(sed -n 's/^name:[[:space:]]*\([A-Za-z0-9_]*\).*/\1/p' pubspec.yaml | head -n 1)
+          [ -n "$PKG_NAME" ] || PKG_NAME=app
+
+          SUMMARY="$RUNNER_TEMP/summary.txt"; : > "$SUMMARY"
+          LAST_LOG=""
+          IDX=0
+          WON=0
+
+          try_candidate() {
+            local idx="$1" tag="$2" java="$3" why="$4"
+            local log="$RUNNER_TEMP/attempt-$idx.log"; LAST_LOG="$log"; : > "$log"
+            log_run() { "$@" </dev/null 2>&1 | tee -a "$log"; return "${PIPESTATUS[0]}"; }
+            echo "::group::Percobaan $idx: Flutter $tag / Java $java ($why)"
+            local stage="install flutter"
+
+            local fdir="$HOME/flutter-$tag"
+            if [ ! -x "$fdir/bin/flutter" ]; then
+              rm -rf "$fdir"
+              log_run git clone --depth 1 --branch "$tag" https://github.com/flutter/flutter.git "$fdir" || { echo "$idx|$tag|$java|$stage" >> "$SUMMARY"; echo "::endgroup::"; return 1; }
+            fi
+            export FLUTTER_ROOT="$fdir"
+            export PATH="$fdir/bin:$(echo "$PATH" | tr ':' '\n' | grep -v '/flutter-' | paste -sd:)"
+
+            stage="setup java $java"
+            local jvar="JAVA_HOME_${java}_X64" jh=""
+            jh="${!jvar:-}"
+            if [ -z "$jh" ] || [ ! -d "$jh" ]; then
+              sudo apt-get install -y -qq "openjdk-${java}-jdk" >/dev/null 2>&1 || true
+              jh=$(ls -d /usr/lib/jvm/java-${java}-openjdk-* 2>/dev/null | head -n 1)
+            fi
+            if [ -z "$jh" ] || [ ! -d "$jh" ]; then echo "Java $java tidak tersedia" | tee -a "$log"; echo "$idx|$tag|$java|$stage" >> "$SUMMARY"; echo "::endgroup::"; return 1; fi
+            export JAVA_HOME="$jh"; export PATH="$jh/bin:$PATH"
+            java -version 2>&1 | tee -a "$log" | head -n 1
+
+            stage="flutter --version"
+            log_run flutter --version || { echo "$idx|$tag|$java|$stage" >> "$SUMMARY"; echo "::endgroup::"; return 1; }
+            flutter config --jdk-dir "$JAVA_HOME" >/dev/null 2>&1 || true
+
+            if [ ! -d android ] || [ ! -f android/gradlew ] || [ ! -f android/gradle/wrapper/gradle-wrapper.jar ]; then
+              stage="generate android folder"
+              echo "Folder/berkas android tidak lengkap, dibuat ulang dengan flutter create..." | tee -a "$log"
+              log_run flutter create --platforms=android --project-name "$PKG_NAME" . || log_run flutter create --project-name "$PKG_NAME" . || true
+              chmod +x android/gradlew 2>/dev/null || true
+            fi
+
+            stage="flutter pub get"
+            if ! log_run flutter pub get; then
+              echo "pub get gagal, coba ulang tanpa pubspec.lock..." | tee -a "$log"
+              mv pubspec.lock "$RUNNER_TEMP/pubspec.lock.bak" 2>/dev/null || true
+              if ! log_run flutter pub get; then
+                mv "$RUNNER_TEMP/pubspec.lock.bak" pubspec.lock 2>/dev/null || true
+                echo "$idx|$tag|$java|$stage" >> "$SUMMARY"; echo "::endgroup::"; return 1
+              fi
+            fi
+
+            stage="flutter build apk"
+            local flags="--$BUILD_TYPE" help
+            help=$(flutter build apk -h 2>&1 || true)
+            grep -q -- '--no-tree-shake-icons' <<< "$help" && flags="$flags --no-tree-shake-icons"
+            grep -q -- '--android-skip-build-dependency-validation' <<< "$help" && flags="$flags --android-skip-build-dependency-validation"
+            [ -n "$FLAVOR" ] && flags="$flags --flavor $FLAVOR"
+            local marker="$RUNNER_TEMP/marker-$idx"; touch "$marker"
+            # shellcheck disable=SC2086
+            if ! log_run flutter build apk $flags $EXTRA_ARGS; then
+              echo "$idx|$tag|$java|$stage" >> "$SUMMARY"; echo "::endgroup::"; return 1
+            fi
+
+            stage="cari APK"
+            local apk
+            apk=$(find . -type f -name '*.apk' -newer "$marker" ! -name '*unaligned*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)
+            if [ -z "$apk" ]; then
+              apk=$(find build -type f -name '*.apk' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)
+            fi
+            if [ -z "$apk" ]; then
+              echo "APK tidak ditemukan setelah build." | tee -a "$log"
+              find build -maxdepth 5 2>/dev/null | head -n 40 | tee -a "$log"
+              echo "$idx|$tag|$java|$stage" >> "$SUMMARY"; echo "::endgroup::"; return 1
+            fi
+            local apkabs; apkabs="$(cd "$(dirname "$apk")" && pwd)/$(basename "$apk")"
+            echo "APK_PATH=$apkabs" >> "$GITHUB_ENV"
+            echo "WINNER=Flutter $tag / Java $java" >> "$GITHUB_ENV"
+            echo "BERHASIL dengan Flutter $tag / Java $java -> $apkabs"
+            echo "::endgroup::"
+            return 0
+          }
+
+          mapfile -t CANDS < "$GITHUB_WORKSPACE/candidates.txt"
+          for LINE in "${CANDS[@]}"; do
+            IFS='|' read -r TAG JAVA WHY <<< "$LINE"
+            [ -n "$TAG" ] || continue
+            IDX=$((IDX+1))
+            ELAPSED=$(( $(date +%s) - START ))
+            if [ "$IDX" -gt 1 ] && [ "$ELAPSED" -gt 4800 ]; then
+              echo "Batas waktu tercapai ($ELAPSED detik), percobaan berikutnya dilewati."; break
+            fi
+            if try_candidate "$IDX" "$TAG" "$JAVA" "$WHY"; then WON=1; break; fi
+            ( cd android 2>/dev/null && ./gradlew --stop >/dev/null 2>&1 ) || true
+            flutter clean >/dev/null 2>&1 || true
+            rm -rf build .dart_tool 2>/dev/null || true
+          done
+
+          if [ "$WON" = 1 ]; then exit 0; fi
+
+          echo "=== RINGKASAN BUILD GAGAL ==="
+          echo "Sudah dicoba $IDX kombinasi versi. Tahap gagal tiap percobaan:"
+          while IFS='|' read -r I T J S; do echo "  #$I Flutter $T / Java $J -> gagal di tahap: $S"; done < "$SUMMARY"
+          for f in $(ls "$RUNNER_TEMP"/attempt-*.log 2>/dev/null | sort -V); do
+            echo "--- error utama $(basename "$f" .log) ---"
+            grep -nE "(Error:|error:|FAILURE:|What went wrong|Could not (resolve|find|get)|Exception|version solving failed|requires|incompatible)" "$f" | head -n 14
+          done
+          echo "--- 60 baris terakhir percobaan terakhir ---"
+          tail -n 60 "$LAST_LOG"
+          echo "=== AKHIR RINGKASAN ==="
+          echo "::error::Build gagal setelah mencoba beberapa versi Flutter/Java. Lihat RINGKASAN BUILD GAGAL di log."
+          exit 1
 
       - name: Upload APK
-        if: success()
+        if: ${{ success() }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.app_name }}-${{ inputs.build_mode }}-attempt-${{ inputs.attempt }}
-          path: build/app/outputs/flutter-apk/*.apk
-          retention-days: 7
+          name: apk-${{ github.event.inputs.jobId }}
+          path: ${{ env.APK_PATH }}
+          if-no-files-found: error
+          retention-days: 3
